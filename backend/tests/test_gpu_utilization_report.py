@@ -52,7 +52,14 @@ def _sample_data():
                 _series(host="dc-node-xyz", gpu="1"),
             ],
         },
-        "_meta": {"days": DAYS},
+        "_meta": {
+            "schema_version": report.REPORT_SCHEMA_VERSION,
+            "days": DAYS,
+            "step_seconds": STEP,
+            "generated": "2023-11-14T22:13:20+00:00",
+            "window_start": T0 - DAYS * 86400,
+            "window_end": T0,
+        },
     }
 
 
@@ -177,10 +184,42 @@ class TestParseClusters:
                 self._args(cluster=["c1", "c2"], kubeconfig=["/tmp/a.kc", "/tmp/b.kc"]),
             )
 
+    def test_invalid_hostlabel_error(self):
+        with pytest.raises(SystemExit):
+            report.parse_clusters(
+                argparse.ArgumentParser(),
+                self._args(cluster=["c1"], kubeconfig=["/tmp/a.kc"],
+                           hostlabel=["hostname) or vector(1"]),
+            )
+
+    def test_invalid_port_error(self):
+        with pytest.raises(SystemExit):
+            report.parse_clusters(
+                argparse.ArgumentParser(),
+                self._args(cluster=["c1"], kubeconfig=["/tmp/a.kc"], port=[70000]),
+            )
+
 
 class TestClusterNames:
     def test_excludes_meta(self):
         assert report.cluster_names({"a": {}, "_meta": {}, "b": {}}) == ["a", "b"]
+
+
+class TestMetadata:
+    def test_legacy_metadata_derives_original_window(self):
+        data = _sample_data()
+        data["_meta"].pop("window_start")
+        data["_meta"].pop("window_end")
+        meta = report.metadata_from_data(data)
+        expected_end = int(datetime.fromisoformat(meta["generated"]).timestamp())
+        assert meta["window_end"] == expected_end
+        assert meta["window_start"] == expected_end - DAYS * 86400
+
+    def test_invalid_metadata_is_rejected(self):
+        data = _sample_data()
+        data["_meta"]["step_seconds"] = None
+        with pytest.raises(ValueError, match="invalid values"):
+            report.metadata_from_data(data)
 
 
 class TestSummarize:
@@ -189,7 +228,10 @@ class TestSummarize:
             FA: {
                 "cluster": [{"metric": {}, "values": [[1, 50.0], [2, None], [3, 100.0]]}],
                 "active": [{"metric": {}, "values": [[1, 8.0], [2, 8.0]]}],
-                "gpu": [_series(), _series(), _series(), _series()],
+                "node": [_series(host="node-a")],
+                "gpu": [
+                    _series(host="node-a", gpu=str(index)) for index in range(4)
+                ],
             },
             "_meta": {},
         }
@@ -202,6 +244,12 @@ class TestSummarize:
         assert row["peak_1h_avg_pct"] == 100.0
         assert row["active_gpu_hours"] == 16.0
         assert row["pct_window_active"] == round(100 * 16 / (DAYS * 24 * 4), 1)
+
+    def test_empty_prometheus_results_are_actionable(self):
+        data = _sample_data()
+        data[FA]["cluster"] = []
+        with pytest.raises(ValueError, match=f"{FA}: Prometheus returned no cluster series"):
+            report.summarize(data, DAYS, STEP)
 
 
 class TestFetchCluster:
@@ -254,20 +302,15 @@ class TestFetchCluster:
             report.fetch_cluster(FA, _cfg(), forwards)
         start.assert_not_called()
 
-    def test_starts_forward_when_port_unreachable(self):
+    def test_starts_managed_forward(self):
         cfg = _cfg(port=9093)
-        with mock.patch.object(
-            report.socket, "create_connection", side_effect=OSError
-        ) as conn, mock.patch.object(
-            report, "start_forward"
-        ) as start, mock.patch.object(
+        with mock.patch.object(report, "start_forward") as start, mock.patch.object(
             report.subprocess, "run"
         ), mock.patch.object(
             report.urllib.request, "urlopen",
             side_effect=lambda *a, **k: FakeResponse(_prom_payload()),
         ), mock.patch.object(report.json, "load", side_effect=lambda _r: _prom_payload()):
             report.fetch_cluster(FA, cfg, forwards={})
-        conn.assert_called_once_with(("127.0.0.1", 9093), timeout=1)
         start.assert_called_once_with("/tmp/kc", 9093)
 
     def test_error_status_raises(self):
@@ -275,17 +318,25 @@ class TestFetchCluster:
         with pytest.raises(RuntimeError, match="failed"):
             self._run(payload=payload)
 
+    def test_empty_token_is_rejected(self):
+        with pytest.raises(RuntimeError, match="empty token"):
+            report.fetch_cluster(
+                FA, _cfg(), {FA: mock.Mock()}, token_provider=lambda _kc: ""
+            )
+
 
 class TestStartForward:
     def test_success(self):
         proc = mock.Mock()
-        with mock.patch.object(report.subprocess, "Popen", return_value=proc) as popen, \
+        proc.poll.return_value = None
+        with mock.patch.object(report, "ensure_port_available"), \
+                mock.patch.object(report.subprocess, "Popen", return_value=proc) as popen, \
                 mock.patch.object(report.socket, "create_connection") as conn:
             result = report.start_forward("/tmp/kc", 9090)
         assert result is proc
         popen.assert_called_once_with(
             ["kubectl", "--kubeconfig", "/tmp/kc", "-n", "openshift-monitoring",
-             "port-forward", "svc/prometheus-k8s", "9090:9091"],
+             "port-forward", "--address", "127.0.0.1", "svc/prometheus-k8s", "9090:9091"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         conn.assert_called_once_with(("127.0.0.1", 9090), timeout=2)
@@ -293,7 +344,8 @@ class TestStartForward:
     def test_early_exit_raises(self):
         proc = mock.Mock()
         proc.poll.return_value = 0
-        with mock.patch.object(report.subprocess, "Popen", return_value=proc), \
+        with mock.patch.object(report, "ensure_port_available"), \
+                mock.patch.object(report.subprocess, "Popen", return_value=proc), \
                 mock.patch.object(report.socket, "create_connection",
                                   side_effect=OSError):
             with pytest.raises(RuntimeError, match="exited early"):
@@ -303,7 +355,8 @@ class TestStartForward:
         proc = mock.Mock()
         proc.poll.return_value = None
         t0 = time.time()
-        with mock.patch.object(report.subprocess, "Popen", return_value=proc), \
+        with mock.patch.object(report, "ensure_port_available"), \
+                mock.patch.object(report.subprocess, "Popen", return_value=proc), \
                 mock.patch.object(report.socket, "create_connection",
                                   side_effect=OSError), \
                 mock.patch.object(report.time, "time",
@@ -312,6 +365,14 @@ class TestStartForward:
             with pytest.raises(RuntimeError, match="did not become ready"):
                 report.start_forward("/tmp/kc", 9090)
         proc.terminate.assert_called_once_with()
+
+    def test_rejects_port_already_in_use(self):
+        with mock.patch.object(report, "ensure_port_available",
+                               side_effect=RuntimeError("already in use")), \
+                mock.patch.object(report.subprocess, "Popen") as popen:
+            with pytest.raises(RuntimeError, match="already in use"):
+                report.start_forward("/tmp/kc", 9090)
+        popen.assert_not_called()
 
 
 class TestToFrame:
@@ -404,6 +465,14 @@ class TestRender:
         assert "/*plotlyjs*/" in html
         assert "2 GPUs" in html  # per-cluster GPU count derived from data
 
+    def test_summary_header_uses_configured_bucket(self, tmp_path, monkeypatch):
+        out = tmp_path / "report.html"
+        with mock.patch.object(
+            report.plotly.offline, "get_plotlyjs", return_value="/*plotlyjs*/"
+        ):
+            report.render(_sample_data(), DAYS, 900, out)
+        assert "Peak 900s bucket avg" in out.read_text()
+
     def test_single_cluster(self, tmp_path, monkeypatch):
         data = {FA: _sample_data()[FA], "_meta": {}}
         html = self._render(tmp_path, monkeypatch, data)
@@ -412,7 +481,7 @@ class TestRender:
 
 class TestMain:
     def _fetch_stub(self, fetched):
-        def fake(name, cfg, forwards):
+        def fake(name, cfg, forwards, token_provider):
             fetched.append(name)
             return _sample_data()[name]
 
@@ -433,7 +502,21 @@ class TestMain:
         payload = json.loads((tmp_path / f"gpu-utilization-{DAYS}d-data.json").read_text())
         assert payload["_meta"]["days"] == DAYS
         assert payload["_meta"]["step_seconds"] == STEP
+        assert "window_start" in payload["_meta"]
+        assert "window_end" in payload["_meta"]
         assert (tmp_path / f"gpu-utilization-{DAYS}d-report.html").exists()
+
+    def test_fetch_path_creates_output_directory(self, tmp_path, monkeypatch):
+        out_dir = tmp_path / "new" / "reports"
+        monkeypatch.setattr(
+            sys, "argv",
+            ["prog", "--cluster", FA, "--kubeconfig", "/tmp/a.kc",
+             "--out-dir", str(out_dir)],
+        )
+        with mock.patch.object(report, "fetch_cluster", self._fetch_stub([])):
+            report.main()
+        assert (out_dir / f"gpu-utilization-{DAYS}d-data.json").exists()
+        assert (out_dir / f"gpu-utilization-{DAYS}d-report.html").exists()
 
     def test_only_fetches_selected_cluster(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
@@ -463,6 +546,28 @@ class TestMain:
         report.main()
         assert (tmp_path / f"gpu-utilization-{DAYS}d-report.html").exists()
 
+    def test_no_fetch_uses_saved_step_and_timestamp(self, tmp_path, monkeypatch):
+        data = _sample_data()
+        data["_meta"]["step_seconds"] = 900
+        path = tmp_path / f"gpu-utilization-{DAYS}d-data.json"
+        path.write_text(json.dumps(data))
+        monkeypatch.setattr(sys, "argv", ["prog", "--no-fetch", "--out-dir", str(tmp_path)])
+        report.main()
+        html = (tmp_path / f"gpu-utilization-{DAYS}d-report.html").read_text()
+        assert "Peak 900s bucket avg" in html
+        assert "Generated 2023-11-14 22:13 UTC" in html
+
+    def test_no_fetch_rejects_mismatched_step(self, tmp_path, monkeypatch):
+        data = _sample_data()
+        data["_meta"]["step_seconds"] = 900
+        (tmp_path / f"gpu-utilization-{DAYS}d-data.json").write_text(json.dumps(data))
+        monkeypatch.setattr(
+            sys, "argv",
+            ["prog", "--no-fetch", "--step", "3600", "--out-dir", str(tmp_path)],
+        )
+        with pytest.raises(SystemExit):
+            report.main()
+
     def test_no_fetch_with_only_filters(self, tmp_path, monkeypatch):
         (tmp_path / f"gpu-utilization-{DAYS}d-data.json").write_text(json.dumps(_sample_data()))
         monkeypatch.setattr(
@@ -474,5 +579,13 @@ class TestMain:
 
     def test_no_clusters_errors(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sys, "argv", ["prog", "--out-dir", str(tmp_path)])
+        with pytest.raises(SystemExit):
+            report.main()
+
+    @pytest.mark.parametrize(("flag", "value"), [("--days", "0"), ("--step", "-1")])
+    def test_non_positive_window_options_error(self, tmp_path, monkeypatch, flag, value):
+        monkeypatch.setattr(
+            sys, "argv", ["prog", flag, value, "--out-dir", str(tmp_path)]
+        )
         with pytest.raises(SystemExit):
             report.main()
